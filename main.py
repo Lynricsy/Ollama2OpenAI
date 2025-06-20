@@ -1,19 +1,20 @@
 import os
 import json
 import asyncio
+import traceback
 from fastapi import FastAPI, Request, HTTPException, Form, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic 
 import httpx
 import uvicorn
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, List, Optional, Union
 from config import config
 from pydantic import BaseModel
 from datetime import datetime, timezone
 
 app = FastAPI()
-client = httpx.AsyncClient()
+client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0))
 templates = Jinja2Templates(directory="templates")
 security = HTTPBasic()
 
@@ -45,6 +46,10 @@ class EmbeddingRequest(BaseModel):
     prompt: Union[str, List[str]]
     options: Optional[Dict] = None
 
+class ShowRequest(BaseModel):
+    model: str
+    verbose: Optional[bool] = False
+
 # 会话管理（简单实现，生产环境建议使用更安全的方式）
 sessions = set()
 
@@ -53,6 +58,10 @@ def is_authenticated(request: Request):
     if not session_id or session_id not in sessions:
         raise RedirectResponse(url="/login", status_code=302)
     return True
+
+def del_key(d: Dict, key: str):
+    if key in d:
+        del d[key]
 
 @app.get("/", response_class=JSONResponse)
 async def root_status():
@@ -157,7 +166,10 @@ async def list_models():
             if not model_id: # 如果 model_id 为空则跳过
                 continue
 
-            name_with_tag = f"{model_id}:latest"
+            if ":" not in model_id:
+                name_with_tag = f"{model_id}:latest"
+            else:
+                name_with_tag = model_id
             created_timestamp = model.get("created")
             
             if created_timestamp:
@@ -249,43 +261,66 @@ async def chat(request: ChatRequest):
                 async for chunk in response.aiter_lines():
                     if chunk:
                         try:
-                            data = json.loads(chunk.removeprefix("data: "))
-                            if "choices" in data and len(data["choices"]) > 0:
-                                choice = data["choices"][0]
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    yield json.dumps({
-                                        "model": request.model,
-                                        "created_at": data.get("created", ""),
-                                        "message": {
-                                            "role": "assistant",
-                                            "content": choice["delta"]["content"]
-                                        },
-                                        "done": choice.get("finish_reason") is not None
-                                    }) + "\n"
+                            chunk = chunk.removeprefix("data: ")
+                            if chunk.strip() != "[DONE]": # 结束标志不处理
+                                data = json.loads(chunk)
+                                iso_time = datetime.fromtimestamp(data.get("created", ""), timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    choice = data["choices"][0]
+                                    if "delta" in choice and "content" in choice["delta"]:
+                                        if choice.get("finish_reason") is None:
+                                            yield json.dumps({
+                                                "model": request.model,
+                                                "created_at": iso_time,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": choice["delta"]["content"]
+                                                },
+                                                "done": False
+                                            }) + "\n"
+                                        else:
+                                            # 发送最后一个完成消息
+                                            yield json.dumps({
+                                                "model": request.model,
+                                                "created_at": iso_time,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": choice["delta"]["content"]
+                                                },
+                                                "done_reason": choice.get("finish_reason"),
+                                                "done": True,
+                                                "total_duration": 0,
+                                                "load_duration": 0,
+                                                "prompt_eval_count": 0,
+                                                "prompt_eval_duration": 0,
+                                                "eval_count": 0,
+                                                "eval_duration": 0 
+                                            }) + "\n"
                         except json.JSONDecodeError as e:
                             print(f"JSON 解析错误: {e}, chunk: {chunk}")  # 添加日志
                             continue
-                
-                # 发送最后一个完成消息
-                yield json.dumps({
-                    "model": request.model,
-                    "created_at": "",
-                    "done": True
-                }) + "\n"
             
-            return StreamingResponse(stream_response(), media_type="text/event-stream")
+            return StreamingResponse(stream_response(), media_type="application/x-ndjson")
         else:
             # 处理非流式响应
             data = response.json()
+            iso_time = datetime.fromtimestamp(data.get("created", ""), timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
             if "choices" in data and len(data["choices"]) > 0:
                 return {
                     "model": request.model,
-                    "created_at": data.get("created", ""),
+                    "created_at": iso_time,
                     "message": {
                         "role": "assistant",
                         "content": data["choices"][0]["message"]["content"]
                     },
-                    "done": True
+                    "done_reason": data["choices"][0].get("finish_reason"),
+                    "done": True,
+                    "total_duration": 0,
+                    "load_duration": 0,
+                    "prompt_eval_count": 0, 
+                    "prompt_eval_duration": 0,
+                    "eval_count": 0,
+                    "eval_duration": 0
                 }
             else:
                 print(f"OpenAI 响应缺少 choices: {data}")  # 添加日志
@@ -299,6 +334,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"解析 OpenAI 响应失败: {str(e)}")
     except Exception as e:
         print(f"未知错误: {str(e)}")  # 添加日志
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"处理请求时发生错误: {str(e)}")
 
 @app.post("/api/generate")
@@ -345,41 +381,65 @@ async def generate(request: GenerateRequest):
                 async for chunk in response.aiter_lines():
                     if chunk:
                         try:
-                            data = json.loads(chunk.removeprefix("data: "))
-                            if "choices" in data and len(data["choices"]) > 0:
-                                choice = data["choices"][0]
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    yield json.dumps({
-                                        "model": request.model,
-                                        "created_at": data.get("created", ""),
-                                        "response": choice["delta"]["content"],
-                                        "done": choice.get("finish_reason") is not None
-                                    }) + "\n"
+                            chunk = chunk.removeprefix("data: ")
+                            if chunk.strip() != "[DONE]": # 结束标志不处理
+                                data = json.loads(chunk)
+                                iso_time = datetime.fromtimestamp(data.get("created", ""), timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    choice = data["choices"][0]
+                                    if "delta" in choice and "content" in choice["delta"]:
+                                        if choice.get("finish_reason") is None:
+                                            yield json.dumps({
+                                                "model": request.model,
+                                                "created_at": iso_time,
+                                                "response": choice["delta"]["content"],
+                                                "done": False
+                                            }) + "\n"
+                                        else:
+                                            # 发送最后一个完成消息
+                                            yield json.dumps({
+                                                "model": request.model,
+                                                "created_at": iso_time,
+                                                "response": choice.get("delta", {}).get("content", ""),
+                                                "done": True,
+                                                "done_reason": choice.get("finish_reason"),
+                                                "context": [],
+                                                "total_duration": 0,
+                                                "load_duration": 0,
+                                                "prompt_eval_count": 0,
+                                                "prompt_eval_duration": 0,
+                                                "eval_count": 0,
+                                                "eval_duration": 0
+                                            }) + "\n"
                         except json.JSONDecodeError:
+                            print(f"JSON 解析错误: {e}, chunk: {chunk}")
                             continue
-                
-                # 发送最后一个完成消息
-                yield json.dumps({
-                    "model": request.model,
-                    "created_at": "",
-                    "done": True
-                }) + "\n"
             
-            return StreamingResponse(stream_response(), media_type="text/event-stream")
+            return StreamingResponse(stream_response(), media_type="application/x-ndjson")
         else:
             # 处理非流式响应
             data = response.json()
+            iso_time = datetime.fromtimestamp(data.get("created", ""), timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000000Z')
             if "choices" in data and len(data["choices"]) > 0:
                 return {
                     "model": request.model,
-                    "created_at": data.get("created", ""),
+                    "created_at": iso_time,
                     "response": data["choices"][0]["message"]["content"],
-                    "done": True
+                    "done": True,
+                    "done_reason": data["choices"][0].get("finish_reason"),
+                    "context": [],
+                    "total_duration": 0,
+                    "load_duration": 0,
+                    "prompt_eval_count": 0, 
+                    "prompt_eval_duration": 0,
+                    "eval_count": 0,
+                    "eval_duration": 0
                 }
             else:
                 raise HTTPException(status_code=500, detail="No response from model")
         
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/embeddings")
@@ -438,7 +498,108 @@ async def create_embedding(request: EmbeddingRequest):
         raise HTTPException(status_code=500, detail=f"解析 OpenAI 响应失败: {str(e)}")
     except Exception as e:
         print(f"未知错误: {str(e)}")  # 添加日志
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"处理请求时发生错误: {str(e)}")
+
+@app.post("/api/show")
+async def show_model(req: ShowRequest):
+    # 从模板文件读取响应
+    template_path = os.path.join("templates", "response-api-show.json")
+    with open(template_path, "r", encoding="utf-8") as f:
+        resp = json.load(f)
+    # 修改一些必要信息
+    resp["model_info"]["general.basename"] = req.model
+    if req.verbose:
+        resp["model_info"]["tokenizer.ggml.merges"] = []
+        resp["model_info"]["tokenizer.ggml.token_type"] = []
+        resp["model_info"]["tokenizer.ggml.tokens"] = []
+    else:
+        resp["model_info"]["tokenizer.ggml.merges"] = None
+        resp["model_info"]["tokenizer.ggml.token_type"] = None
+        resp["model_info"]["tokenizer.ggml.tokens"] = None
+    return resp
+
+@app.post("/v1/chat/completions")
+async def forward_chat(request: Request):
+    try:
+        # 调整请求头
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length", "authorization"]}
+        headers["authorization"] = f"Bearer {config.openai_api_key}"
+
+        # 调整请求体
+        openai_body = await request.json()
+        openai_body["model"] = config.model_mapping.get(openai_body["model"], openai_body["model"])
+
+        # 转发请求到上游
+        response = await client.post(
+            f"{config.openai_api_base}/v1/chat/completions",
+            json=openai_body,
+            headers=headers
+        )
+
+        # 处理响应数据
+        if response.headers.get("content-type") == "text/event-stream":
+            # 处理流式响应
+            async def stream_response():
+                await asyncio.sleep(0.3)  # magic wait
+                async for chunk in response.aiter_lines():
+                    if chunk: # 忽略按行读取时的空行
+                        try:
+                            chunk = chunk.removeprefix("data: ")
+                            if chunk.strip() != "[DONE]": # 结束标志不处理
+                                # 修改响应格式
+                                data = json.loads(chunk)
+                                data["id"] = "chatcmpl-133"
+                                data["system_fingerprint"] = "fp_ollama"
+                                if "choices" in data:
+                                    for choice in data["choices"]:
+                                        del_key(choice, "text")
+                                chunk = json.dumps(data)
+
+                            yield f"data: {chunk}\n\n"
+                        except json.JSONDecodeError as e:
+                            print(f"JSON 解析错误: {e}, chunk: {chunk}")  # 添加日志
+                            continue
+
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
+        else:
+            # 修改非流式响应
+            data = response.json()
+            data["id"] = "chatcmpl-106"
+            data["system_fingerprint"] = "fp_ollama"
+
+            return data
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"转发请求失败: {str(e)}")
+
+@app.get("/v1/models")
+async def get_models(request: Request):
+    try:
+        # 调整请求头
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length", "authorization"]}
+        headers["authorization"] = f"Bearer {config.openai_api_key}"
+
+        # 转发请求到上游
+        response = await client.get(
+            f"{config.openai_api_base}/v1/models",
+            headers=headers
+        )
+
+        # 处理响应数据
+        resp = response.json()
+        resp["object"] = "list"
+        if "data" in resp:
+            for _d in resp["data"]:
+                del_key(_d, "permission")
+                del_key(_d, "root")
+                del_key(_d, "parent")
+        del_key(resp, "success")
+        
+        return resp
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"转发请求失败: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
